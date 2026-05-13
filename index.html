@@ -3,6 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <title>AI Teleprompter</title>
+<!-- mammoth.js: parses .docx into semantic HTML (headings, bold, italic, lists) -->
+<script src="https://unpkg.com/mammoth@1.6.0/mammoth.browser.min.js"></script>
 <style>
   :root {
     --bg: #0a0e1a;
@@ -194,6 +196,49 @@
     color: var(--text-faded);
     user-select: text;
   }
+  /* Rich content from .docx uploads — headings, lists, emphasis */
+  .script p { margin: 0 0 0.8em 0; }
+  .script h1, .script h2, .script h3, .script h4 {
+    color: var(--accent);
+    font-weight: 700;
+    line-height: 1.25;
+    margin: 0.5em 0 0.35em 0;
+  }
+  .script h1 {
+    font-size: 1.4em;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid rgba(212, 168, 74, 0.25);
+    padding-bottom: 0.15em;
+  }
+  .script h2 { font-size: 1.22em; color: #e6c469; }
+  .script h3 { font-size: 1.08em; color: #e8ecf5; }
+  .script h4 { font-size: 1em; color: #c8d0e0; }
+  .script ul, .script ol {
+    padding-left: 1.4em;
+    margin: 0 0 1em 0;
+  }
+  .script li {
+    margin: 0 0 0.35em 0;
+  }
+  .script li::marker { color: var(--accent); }
+  .script strong, .script b { font-weight: 800; color: #ffffff; }
+  .script em, .script i { font-style: italic; }
+  .script mark, .script .hl {
+    background: rgba(212, 168, 74, 0.28);
+    color: inherit;
+    padding: 0 4px;
+    border-radius: 3px;
+  }
+  .script a { color: var(--accent); text-decoration: underline; }
+  .script table {
+    border-collapse: collapse;
+    margin: 0 0 1em 0;
+    font-size: 0.9em;
+  }
+  .script td, .script th {
+    border: 1px solid var(--border);
+    padding: 6px 10px;
+  }
   .word {
     display: inline;
     transition: color 0.15s;
@@ -298,6 +343,8 @@
 
   <button id="toggleEditorBtn" title="Show/hide script editor">Hide Editor</button>
   <button id="loadSampleBtn" title="Load a sample script">Load Sample</button>
+  <button id="uploadBtn" title="Upload a Word document (.docx) — preserves headings, bullets, bold, italic">Upload .docx</button>
+  <input type="file" id="uploadInput" accept=".docx" style="display:none" />
   <button id="clearBtn">Clear</button>
 
   <span class="spacer"></span>
@@ -389,6 +436,8 @@
   const clearBtn = $('clearBtn');
   const loadSampleBtn = $('loadSampleBtn');
   const toggleEditorBtn = $('toggleEditorBtn');
+  const uploadBtn = $('uploadBtn');
+  const uploadInput = $('uploadInput');
   const editor = $('editor');
   const statusDot = $('statusDot');
   const statusText = $('statusText');
@@ -457,12 +506,19 @@
     state.words = [];
     state.wordEls = [];
     state.cursor = 0;
+    state.committedCursor = 0;
+    state.spokenHistory = [];
+
+    // Leaving rich mode whenever we render plain text.
+    delete scriptDisplay.dataset.richMode;
+    delete scriptDisplay.dataset.fileName;
 
     scriptDisplay.innerHTML = '';
 
     if (!text.trim()) {
       scriptDisplay.innerHTML = `<div class="empty">
-        Paste a script in the editor on the left, then click <kbd>Start Listening</kbd>.<br><br>
+        Paste a script in the editor on the left, click <kbd>Upload .docx</kbd> for a Word doc,
+        then hit <kbd>Start Listening</kbd>.<br><br>
         The text will follow you as you speak. Pause, slow down, or speed up — it stays with you.
       </div>`;
       wordCountEl.textContent = '0 words';
@@ -475,7 +531,6 @@
 
     paragraphs.forEach((para, pIdx) => {
       const pEl = document.createElement('p');
-      pEl.style.margin = '0 0 1em 0';
 
       // Split into tokens that include word + trailing whitespace/punct
       // We render each word as a span and keep punctuation attached as plain text
@@ -506,6 +561,77 @@
 
     // Reset visual state
     advanceCursor(0, /*resetVisual=*/true);
+  }
+
+  // Render rich HTML (from a .docx) into the prompter while still tokenizing
+  // every text node into matchable .word spans. Headings, bullets, bold,
+  // italic, etc. all keep their wrapping elements; we just walk down and
+  // replace each text node with a fragment of word-spans + whitespace.
+  function loadRichScript(html, plainText, filename) {
+    state.words = [];
+    state.wordEls = [];
+    state.cursor = 0;
+    state.committedCursor = 0;
+    state.spokenHistory = [];
+
+    const hasContent = !!(html && html.trim());
+    scriptDisplay.innerHTML = hasContent
+      ? html
+      : '<div class="empty">The uploaded document looks empty.</div>';
+
+    if (hasContent) walkAndWrapWords(scriptDisplay);
+
+    scriptDisplay.dataset.richMode = '1';
+    scriptDisplay.dataset.fileName = filename;
+    // Keep textarea + dataset.loadedText in sync with plain text so the
+    // "did the editor change?" check in startListening doesn't reload and
+    // clobber the rich content. If the user edits the textarea after this,
+    // their plain edit wins and we fall back to plain-text mode.
+    scriptInput.value = plainText;
+    scriptDisplay.dataset.loadedText = plainText;
+
+    const label = filename ? `${filename} — ${state.words.length} words` : `${state.words.length} words`;
+    wordCountEl.textContent = label;
+
+    advanceCursor(0, /*resetVisual=*/true);
+  }
+
+  // Walk every text node under `root` and replace each with a fragment that
+  // wraps each whitespace-separated word in <span class="word">. Whitespace
+  // is preserved as plain text nodes. Word entries get pushed to state.words
+  // in document order, which is what the matcher needs.
+  function walkAndWrapWords(root) {
+    const textNodes = [];
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null);
+    let node;
+    while ((node = walker.nextNode())) {
+      if (node.nodeValue && node.nodeValue.length) textNodes.push(node);
+    }
+
+    for (const tn of textNodes) {
+      const parent = tn.parentNode;
+      if (!parent) continue;
+      const tokens = tn.nodeValue.match(/\S+|\s+/g);
+      if (!tokens) continue;
+
+      const frag = document.createDocumentFragment();
+      for (const tok of tokens) {
+        if (/^\s+$/.test(tok)) {
+          frag.appendChild(document.createTextNode(tok.replace(/\n/g, ' ')));
+          continue;
+        }
+        const norm = normalizeWord(tok);
+        const span = document.createElement('span');
+        span.className = 'word';
+        span.textContent = tok;
+        frag.appendChild(span);
+        if (norm) {
+          state.words.push({ norm, el: span });
+          state.wordEls.push(span);
+        }
+      }
+      parent.replaceChild(frag, tn);
+    }
   }
 
   // ---------- Cursor / scrolling ----------
@@ -727,6 +853,59 @@
     scriptInput.value = SAMPLE_SCRIPT;
     loadScript(SAMPLE_SCRIPT);
     scriptDisplay.dataset.loadedText = SAMPLE_SCRIPT;
+  });
+
+  // ---------- .docx upload ----------
+  uploadBtn.addEventListener('click', () => uploadInput.click());
+
+  uploadInput.addEventListener('change', async (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    if (typeof mammoth === 'undefined') {
+      alert('Document parser failed to load — check your internet connection and refresh.');
+      return;
+    }
+    if (state.listening) stopListening();
+
+    setStatus('idle', `Reading ${file.name}…`);
+    try {
+      const buffer = await file.arrayBuffer();
+
+      // Mammoth converts .docx into clean semantic HTML. The style map below
+      // catches Word's built-in heading styles even when Word doesn't emit
+      // canonical names (e.g. "Title" -> h1, custom "Quote" -> blockquote).
+      const styleMap = [
+        "p[style-name='Title'] => h1:fresh",
+        "p[style-name='Subtitle'] => h2:fresh",
+        "p[style-name='Heading 1'] => h1:fresh",
+        "p[style-name='Heading 2'] => h2:fresh",
+        "p[style-name='Heading 3'] => h3:fresh",
+        "p[style-name='Heading 4'] => h4:fresh",
+        "p[style-name='Quote'] => blockquote:fresh",
+        "p[style-name='Intense Quote'] => blockquote:fresh",
+        "b => strong",
+        "i => em",
+      ];
+
+      const [htmlResult, textResult] = await Promise.all([
+        mammoth.convertToHtml({ arrayBuffer: buffer }, { styleMap }),
+        mammoth.extractRawText({ arrayBuffer: buffer }),
+      ]);
+
+      if (htmlResult.messages && htmlResult.messages.length) {
+        console.log('Mammoth conversion messages:', htmlResult.messages);
+      }
+
+      loadRichScript(htmlResult.value || '', textResult.value || '', file.name);
+      setStatus('idle', `Loaded ${file.name}`);
+    } catch (err) {
+      console.error('Upload failed:', err);
+      alert('Could not read that file:\n\n' + (err && err.message ? err.message : err));
+      setStatus('error', 'Upload failed');
+    } finally {
+      // Reset the input so selecting the same file again still fires change.
+      uploadInput.value = '';
+    }
   });
 
   toggleEditorBtn.addEventListener('click', () => {
