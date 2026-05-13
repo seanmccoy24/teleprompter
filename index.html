@@ -308,7 +308,7 @@
   </div>
   <div class="control-group">
     <label for="lookahead">Lookahead</label>
-    <input type="range" id="lookahead" min="5" max="40" value="15" title="How far ahead to search for the spoken word" />
+    <input type="range" id="lookahead" min="4" max="30" value="10" title="How far ahead to search for the spoken word — lower = stricter follow, higher = more forgiving of skipped/missed words" />
   </div>
 
   <button id="resetBtn" title="Jump back to the start">Reset</button>
@@ -362,13 +362,11 @@
   const state = {
     words: [],          // script words, normalized + original
     wordEls: [],        // DOM elements per word
-    cursor: 0,          // index of next word to match
+    cursor: 0,          // currently displayed cursor (advances with interim guesses)
+    committedCursor: 0, // advances ONLY on finalized speech; never replayed
     listening: false,
     recognition: null,
-    lookahead: 15,
-    lastTranscriptLen: 0,
-    finalProcessedLen: 0,
-    pendingRestart: false,
+    lookahead: 10,
   };
 
   // ---------- DOM ----------
@@ -403,6 +401,9 @@
     if (spoken === script) return true;
     // Number-word equivalence
     if (NUMBER_WORDS[spoken] === script || NUMBER_WORDS[script] === spoken) return true;
+    // For very short words, require exact match — otherwise "the" matches "their", "to"
+    // matches "today", etc., which causes false long-range jumps.
+    if (spoken.length <= 3 || script.length <= 3) return false;
     // Allow plural / -ing / -ed slack
     if (script.startsWith(spoken) && script.length - spoken.length <= 3) return true;
     if (spoken.startsWith(script) && spoken.length - script.length <= 3) return true;
@@ -542,49 +543,39 @@
   }
 
   // ---------- Speech processing ----------
-  // Each time we receive a (possibly growing) transcript, look at any new words
-  // since last time and try to advance the cursor.
-  function processTranscript(fullText, isFinal) {
-    const tokens = fullText.split(/\s+/).map(normalizeWord).filter(Boolean);
-
-    // Determine how many tokens we've already consumed for matching
-    // We use finalProcessedLen for committed (final) results, plus interim above that.
-    const startFrom = state.finalProcessedLen;
-    const newTokens = tokens.slice(startFrom);
-
-    // Advance cursor for each new token if it matches within lookahead window
-    let cursor = state.cursor;
-    let advanced = 0;
-    const lookahead = state.lookahead;
-
-    for (const spoken of newTokens) {
-      let matchIdx = -1;
-      const end = Math.min(state.words.length, cursor + lookahead);
-      for (let i = cursor; i < end; i++) {
-        if (wordMatches(spoken, state.words[i].norm)) {
-          matchIdx = i;
-          break;
-        }
+  // Try to advance `cursor` by matching `spoken` against the script within
+  // the lookahead window. Returns the new cursor (unchanged if no match).
+  function tryAdvance(cursor, spoken) {
+    const end = Math.min(state.words.length, cursor + state.lookahead);
+    for (let i = cursor; i < end; i++) {
+      if (wordMatches(spoken, state.words[i].norm)) {
+        return i + 1;
       }
-      if (matchIdx >= 0) {
-        cursor = matchIdx + 1;
-        advanced++;
-      }
-      // If no match found, ignore this spoken word — it may be a filler
-      // ("um", "uh"), a misrecognition, or an ad-lib aside.
+    }
+    return cursor;
+  }
+
+  // Process a single recognition event:
+  //   - newFinalTokens: tokens that became FINAL this event (never replayed)
+  //   - currentInterimTokens: current interim guess (replaces last interim)
+  // We advance state.committedCursor by finals (durable), then overlay interim
+  // on top, recomputed from scratch each event so replays never compound.
+  function processResults(newFinalTokens, currentInterimTokens) {
+    for (const spoken of newFinalTokens) {
+      state.committedCursor = tryAdvance(state.committedCursor, spoken);
     }
 
-    if (advanced > 0) {
-      advanceCursor(cursor);
+    let displayCursor = state.committedCursor;
+    for (const spoken of currentInterimTokens) {
+      displayCursor = tryAdvance(displayCursor, spoken);
     }
 
-    if (isFinal) {
-      state.finalProcessedLen = tokens.length;
+    if (displayCursor !== state.cursor) {
+      advanceCursor(displayCursor);
     }
 
-    // Update transcript display (last ~8 words)
-    const recent = tokens.slice(-8).join(' ');
-    transcriptText.textContent = recent || '…';
+    const recent = [...newFinalTokens, ...currentInterimTokens].slice(-8).join(' ');
+    if (recent) transcriptText.textContent = recent;
   }
 
   // ---------- Recognition setup ----------
@@ -599,21 +590,17 @@
     };
 
     rec.onresult = (e) => {
-      let finalText = '';
-      let interimText = '';
-      for (let i = 0; i < e.results.length; i++) {
+      // Only look at results that changed this event (resultIndex onward).
+      // Results that already became final in earlier events are not re-processed.
+      const newFinalTokens = [];
+      const currentInterimTokens = [];
+      for (let i = e.resultIndex; i < e.results.length; i++) {
         const r = e.results[i];
-        if (r.isFinal) finalText += r[0].transcript + ' ';
-        else interimText += r[0].transcript + ' ';
+        const toks = r[0].transcript.split(/\s+/).map(normalizeWord).filter(Boolean);
+        if (r.isFinal) newFinalTokens.push(...toks);
+        else currentInterimTokens.push(...toks);
       }
-      // Process final + interim together so we react in real time
-      processTranscript(finalText + interimText, /*isFinal=*/false);
-      // Also update final processed count when we have final results
-      if (finalText) {
-        // Note: finalText accumulates the FULL final transcript so far in this session
-        const finalTokens = finalText.split(/\s+/).map(normalizeWord).filter(Boolean);
-        state.finalProcessedLen = finalTokens.length;
-      }
+      processResults(newFinalTokens, currentInterimTokens);
     };
 
     rec.onerror = (e) => {
@@ -652,7 +639,7 @@
     }
 
     state.listening = true;
-    state.finalProcessedLen = 0;
+    state.committedCursor = state.cursor;
     state.recognition = createRecognition();
     transcriptBar.classList.remove('hidden');
     try {
@@ -691,7 +678,7 @@
   });
 
   resetBtn.addEventListener('click', () => {
-    state.finalProcessedLen = 0;
+    state.committedCursor = 0;
     state.wordEls.forEach(el => el.classList.remove('spoken', 'current'));
     advanceCursor(0, /*resetVisual=*/true);
   });
@@ -748,11 +735,12 @@
     } else if (e.key === 'e' || e.key === 'E') {
       toggleEditorBtn.click();
     } else if (e.key === 'ArrowDown') {
-      // Manual nudge forward
-      advanceCursor(state.cursor + 1);
+      const newIdx = Math.min(state.words.length, state.cursor + 1);
+      state.committedCursor = newIdx;
+      advanceCursor(newIdx);
     } else if (e.key === 'ArrowUp') {
-      // Manual nudge backward
       const newIdx = Math.max(0, state.cursor - 1);
+      state.committedCursor = newIdx;
       state.wordEls.forEach(el => el.classList.remove('spoken', 'current'));
       for (let i = 0; i < newIdx; i++) state.words[i].el.classList.add('spoken');
       advanceCursor(newIdx);
