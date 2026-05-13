@@ -308,7 +308,7 @@
   </div>
   <div class="control-group">
     <label for="lookahead">Lookahead</label>
-    <input type="range" id="lookahead" min="4" max="30" value="10" title="How far ahead to search for the spoken word — lower = stricter follow, higher = more forgiving of skipped/missed words" />
+    <input type="range" id="lookahead" min="4" max="30" value="10" title="How far ahead to search for a matching 2-3 word sequence — lower = stricter follow, higher = more forgiving of skipped or missed words" />
   </div>
 
   <button id="resetBtn" title="Jump back to the start">Reset</button>
@@ -364,10 +364,20 @@
     wordEls: [],        // DOM elements per word
     cursor: 0,          // currently displayed cursor (advances with interim guesses)
     committedCursor: 0, // advances ONLY on finalized speech; never replayed
+    spokenHistory: [],  // rolling buffer of recent FINAL spoken tokens (normalized)
     listening: false,
     recognition: null,
     lookahead: 10,
   };
+
+  // N-gram matching constants. We require a sequence of 2-3 spoken words to match
+  // a consecutive run in the script before advancing the cursor. This gives much
+  // stronger evidence per match than single-word matching (so common words like
+  // "the" / "for" / "a" can't trigger jumps), and naturally tolerates off-script
+  // speech — if no sequence matches, the cursor simply stays put.
+  const NGRAM_MAX = 3;
+  const NGRAM_MIN = 2;
+  const HISTORY_SIZE = 8;
 
   // ---------- DOM ----------
   const $ = id => document.getElementById(id);
@@ -543,13 +553,25 @@
   }
 
   // ---------- Speech processing ----------
-  // Try to advance `cursor` by matching `spoken` against the script within
-  // the lookahead window. Returns the new cursor (unchanged if no match).
-  function tryAdvance(cursor, spoken) {
+  // Try to advance `cursor` by finding an N-gram from the tail of `history`
+  // (recently spoken words) that matches a consecutive run of script words
+  // within the lookahead window. Prefers longer N-grams (stronger evidence).
+  // Returns the new cursor — positioned just past the matched sequence —
+  // or `cursor` unchanged if no sequence matches.
+  function tryAdvanceNgram(cursor, history) {
     const end = Math.min(state.words.length, cursor + state.lookahead);
-    for (let i = cursor; i < end; i++) {
-      if (wordMatches(spoken, state.words[i].norm)) {
-        return i + 1;
+
+    for (let n = NGRAM_MAX; n >= NGRAM_MIN; n--) {
+      if (history.length < n) continue;
+      const ngram = history.slice(-n);
+
+      // Scan the lookahead window for a position where script[i..i+n-1] matches.
+      for (let i = cursor; i <= end - n; i++) {
+        let ok = true;
+        for (let j = 0; j < n; j++) {
+          if (!wordMatches(ngram[j], state.words[i + j].norm)) { ok = false; break; }
+        }
+        if (ok) return i + n;
       }
     }
     return cursor;
@@ -558,16 +580,25 @@
   // Process a single recognition event:
   //   - newFinalTokens: tokens that became FINAL this event (never replayed)
   //   - currentInterimTokens: current interim guess (replaces last interim)
-  // We advance state.committedCursor by finals (durable), then overlay interim
-  // on top, recomputed from scratch each event so replays never compound.
+  //
+  // For finals: append each to spokenHistory and try to advance committedCursor
+  //   using the new tail of history (so we catch 2-grams and 3-grams as they form).
+  // For interim: build a tentative history = committedHistory + interim, then walk
+  //   it forward to get a displayCursor on top of the committed one. Recomputed
+  //   from scratch every event, so interim "replays" never compound the cursor.
   function processResults(newFinalTokens, currentInterimTokens) {
-    for (const spoken of newFinalTokens) {
-      state.committedCursor = tryAdvance(state.committedCursor, spoken);
+    for (const tok of newFinalTokens) {
+      state.spokenHistory.push(tok);
+      if (state.spokenHistory.length > HISTORY_SIZE) state.spokenHistory.shift();
+      state.committedCursor = tryAdvanceNgram(state.committedCursor, state.spokenHistory);
     }
 
     let displayCursor = state.committedCursor;
-    for (const spoken of currentInterimTokens) {
-      displayCursor = tryAdvance(displayCursor, spoken);
+    const tentativeHistory = state.spokenHistory.slice();
+    for (const tok of currentInterimTokens) {
+      tentativeHistory.push(tok);
+      if (tentativeHistory.length > HISTORY_SIZE) tentativeHistory.shift();
+      displayCursor = tryAdvanceNgram(displayCursor, tentativeHistory);
     }
 
     if (displayCursor !== state.cursor) {
@@ -640,6 +671,7 @@
 
     state.listening = true;
     state.committedCursor = state.cursor;
+    state.spokenHistory = [];
     state.recognition = createRecognition();
     transcriptBar.classList.remove('hidden');
     try {
@@ -679,6 +711,7 @@
 
   resetBtn.addEventListener('click', () => {
     state.committedCursor = 0;
+    state.spokenHistory = [];
     state.wordEls.forEach(el => el.classList.remove('spoken', 'current'));
     advanceCursor(0, /*resetVisual=*/true);
   });
@@ -737,10 +770,12 @@
     } else if (e.key === 'ArrowDown') {
       const newIdx = Math.min(state.words.length, state.cursor + 1);
       state.committedCursor = newIdx;
+      state.spokenHistory = [];
       advanceCursor(newIdx);
     } else if (e.key === 'ArrowUp') {
       const newIdx = Math.max(0, state.cursor - 1);
       state.committedCursor = newIdx;
+      state.spokenHistory = [];
       state.wordEls.forEach(el => el.classList.remove('spoken', 'current'));
       for (let i = 0; i < newIdx; i++) state.words[i].el.classList.add('spoken');
       advanceCursor(newIdx);
