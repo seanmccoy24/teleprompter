@@ -681,17 +681,17 @@
   // ---------- Speech processing ----------
   // Try to advance `cursor` by finding an N-gram from the tail of `history`
   // (recently spoken words) that matches a consecutive run of script words
-  // within the lookahead window. Prefers longer N-grams (stronger evidence).
-  // Returns the new cursor — positioned just past the matched sequence —
-  // or `cursor` unchanged if no sequence matches.
-  function tryAdvanceNgram(cursor, history) {
-    const end = Math.min(state.words.length, cursor + state.lookahead);
+  // within `lookaheadDist` words ahead. Prefers longer N-grams (stronger
+  // evidence). Returns the new cursor — positioned just past the matched
+  // sequence — or `cursor` unchanged if no sequence matches.
+  function tryAdvanceNgram(cursor, history, lookaheadDist) {
+    const dist = lookaheadDist ?? state.lookahead;
+    const end = Math.min(state.words.length, cursor + dist);
 
     for (let n = NGRAM_MAX; n >= NGRAM_MIN; n--) {
       if (history.length < n) continue;
       const ngram = history.slice(-n);
 
-      // Scan the lookahead window for a position where script[i..i+n-1] matches.
       for (let i = cursor; i <= end - n; i++) {
         let ok = true;
         for (let j = 0; j < n; j++) {
@@ -707,16 +707,26 @@
   //   - newFinalTokens: tokens that became FINAL this event (never replayed)
   //   - currentInterimTokens: current interim guess (replaces last interim)
   //
-  // For finals: append each to spokenHistory and try to advance committedCursor
-  //   using the new tail of history (so we catch 2-grams and 3-grams as they form).
-  // For interim: build a tentative history = committedHistory + interim, then walk
-  //   it forward to get a displayCursor on top of the committed one. Recomputed
-  //   from scratch every event, so interim "replays" never compound the cursor.
+  // For finals: append each to spokenHistory and try to advance committedCursor.
+  //   When interim has carried the visible cursor ahead of committed, give
+  //   committed a wider runway so new finals can promote it up toward where
+  //   the speaker actually is — otherwise committed stays stuck behind and
+  //   any interim revision causes a giant visible regression.
+  // For interim: build a tentative history = committedHistory + interim, walk
+  //   it forward to get a displayCursor on top of committed. Recomputed from
+  //   scratch every event, so interim "replays" never compound the cursor.
+  // Ratchet: the visible cursor never retreats based on speech. The speaker
+  //   reads linearly forward; Web Speech's interim hypothesis is allowed to
+  //   shrink or get revised, but those revisions must not drag the cursor
+  //   backward. (Manual rewind via ArrowUp / Reset still works — those reset
+  //   state.cursor explicitly, so the ratchet's new floor is the new position.)
   function processResults(newFinalTokens, currentInterimTokens) {
     for (const tok of newFinalTokens) {
       state.spokenHistory.push(tok);
       if (state.spokenHistory.length > HISTORY_SIZE) state.spokenHistory.shift();
-      state.committedCursor = tryAdvanceNgram(state.committedCursor, state.spokenHistory);
+      const lag = Math.max(0, state.cursor - state.committedCursor);
+      const catchupDist = state.lookahead + lag;
+      state.committedCursor = tryAdvanceNgram(state.committedCursor, state.spokenHistory, catchupDist);
     }
 
     let displayCursor = state.committedCursor;
@@ -726,6 +736,8 @@
       if (tentativeHistory.length > HISTORY_SIZE) tentativeHistory.shift();
       displayCursor = tryAdvanceNgram(displayCursor, tentativeHistory);
     }
+
+    if (displayCursor < state.cursor) displayCursor = state.cursor;
 
     if (displayCursor !== state.cursor) {
       advanceCursor(displayCursor);
