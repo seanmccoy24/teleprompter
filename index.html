@@ -241,7 +241,12 @@
   }
   .word {
     display: inline;
-    transition: color 0.15s;
+    transition: color 0.15s, background 0.1s;
+    cursor: pointer;
+  }
+  .word:hover {
+    background: rgba(212, 168, 74, 0.14);
+    border-radius: 4px;
   }
   .word.spoken {
     color: var(--text-dim);
@@ -668,6 +673,34 @@
     }
   }
 
+  // Jump the cursor to an arbitrary word index — used by clicks and arrow-key
+  // seeks. Unlike advanceCursor, this can move BACKWARD: it repaints the
+  // spoken/current state from scratch (clearing any stale 'spoken' marks past
+  // the new position) and re-syncs committedCursor + spokenHistory so the
+  // matcher resumes cleanly from the new position rather than trying to walk
+  // forward from where it was before.
+  function jumpToCursor(newIdx) {
+    if (newIdx < 0) newIdx = 0;
+    if (newIdx > state.words.length) newIdx = state.words.length;
+
+    state.cursor = newIdx;
+    state.committedCursor = newIdx;
+    state.spokenHistory = [];
+
+    state.wordEls.forEach((el, i) => {
+      el.classList.remove('current', 'spoken');
+      if (i < newIdx) el.classList.add('spoken');
+    });
+
+    const currentEl = state.words[newIdx]?.el;
+    if (currentEl) {
+      currentEl.classList.add('current');
+      scrollWordIntoFocus(currentEl);
+    } else if (state.words.length > 0) {
+      scrollWordIntoFocus(state.words[state.words.length - 1].el);
+    }
+  }
+
   function scrollWordIntoFocus(el) {
     const wrapRect = prompter.getBoundingClientRect();
     const elRect = el.getBoundingClientRect();
@@ -847,11 +880,22 @@
     else startListening();
   });
 
+  // Click any word in the script to jump the cursor there. Works mid-presentation
+  // too — the matcher re-syncs to the clicked position and resumes following.
+  // Drag-to-select still works (this only fires on a non-drag click).
+  scriptDisplay.addEventListener('click', (e) => {
+    const wordEl = e.target.closest('.word');
+    if (!wordEl) return;
+    // If the user is selecting text, don't treat the mouseup as a jump.
+    const sel = window.getSelection && window.getSelection();
+    if (sel && !sel.isCollapsed && sel.toString().length > 0) return;
+    const idx = state.wordEls.indexOf(wordEl);
+    if (idx < 0) return;
+    jumpToCursor(idx);
+  });
+
   resetBtn.addEventListener('click', () => {
-    state.committedCursor = 0;
-    state.spokenHistory = [];
-    state.wordEls.forEach(el => el.classList.remove('spoken', 'current'));
-    advanceCursor(0, /*resetVisual=*/true);
+    jumpToCursor(0);
   });
 
   clearBtn.addEventListener('click', () => {
@@ -959,17 +1003,9 @@
     } else if (e.key === 'e' || e.key === 'E') {
       toggleEditorBtn.click();
     } else if (e.key === 'ArrowDown') {
-      const newIdx = Math.min(state.words.length, state.cursor + 1);
-      state.committedCursor = newIdx;
-      state.spokenHistory = [];
-      advanceCursor(newIdx);
+      jumpToCursor(state.cursor + 1);
     } else if (e.key === 'ArrowUp') {
-      const newIdx = Math.max(0, state.cursor - 1);
-      state.committedCursor = newIdx;
-      state.spokenHistory = [];
-      state.wordEls.forEach(el => el.classList.remove('spoken', 'current'));
-      for (let i = 0; i < newIdx; i++) state.words[i].el.classList.add('spoken');
-      advanceCursor(newIdx);
+      jumpToCursor(state.cursor - 1);
     }
   });
 
